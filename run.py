@@ -4,7 +4,9 @@ import torch
 torch.manual_seed(97)
 from dataloader import DataGenerator
 from model import FlightBERT_PP
-from utils import load_config_from_json, print_attrs, file_print, convert2binfromlist
+from utils import (load_config_from_json, print_attrs, file_print, convert2binfromlist,
+                   calculate_max_distance, calculate_trajectory_frechet_distance, 
+                   calculate_trajectory_dtw_distance, calculate_trajectory_dtw_distance_whole)
 import os
 import tqdm
 from torch.utils.data import DataLoader
@@ -12,6 +14,7 @@ import numpy as np
 import time
 import argparse
 from sklearn import metrics
+from torch.utils.tensorboard import SummaryWriter
 
 data_worker = 0
 iscuda = torch.cuda.is_available()
@@ -32,10 +35,12 @@ def save_torch_model(model, opt, save_path):
     torch.save(checkpt, save_path)
 
 
-def load_torch_model(model, model_path):
+def load_torch_model(model, optimizer, model_path):
     map_location = None if iscuda else 'cpu'
     ckpt = torch.load(model_path, map_location=map_location)
     model.load_state_dict(ckpt['model_state_dict'])
+    if optimizer is not None and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
 def worker_init_fn(worker_id):
     np.random.seed(7 + worker_id)
@@ -62,6 +67,15 @@ class TrainClient():
         self.train_costs, self.val_costs = [], []
         self.vocab_size = 0
         self.keep_model_list = []
+        # Add unique run id for each tensorboard run
+        run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        tensorboard_dir = getattr(self.configs, 'tensorboard_dir', 'tensorboard')
+        tensorboard_filename = getattr(self.configs, 'tensorboard_filename', run_id)
+        self.writer = SummaryWriter(log_dir=os.path.join(self.log_path, tensorboard_dir, tensorboard_filename))
+
+        # Log learning configuration to tensorboard
+        config_text = '\n'.join([f'{k}: {v}' for k, v in self.configs.__dict__.items() if not k.startswith('__')])
+        self.writer.add_text('Learning Configuration', config_text, 0)
 
     def load_data(self):
         print("Load data...")
@@ -106,10 +120,16 @@ class TrainClient():
         self.optimiser = torch.optim.Adam(self.model.parameters(), lr=self.configs.learning_rate)
         self.opt_lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimiser, step_size=20, gamma=0.7)
         model_path = self.configs.model_path
+        start_epoch = 0
 
-        if model_path != '' or (not self.configs.is_training):
+        if model_path != '':
             self.logger("Reload params from " + model_path, self.log_file)
             load_torch_model(self.model, self.optimiser, model_path)
+            # Try to extract epoch from filename if possible
+            import re
+            match = re.search(r'epoch_(\\d+)_', os.path.basename(model_path))
+            if match:
+                start_epoch = int(match.group(1)) + 1
 
         for p in self.model.parameters():
             p.requires_grad = True
@@ -118,10 +138,9 @@ class TrainClient():
         print(self.model)
 
         print('train process...')
-        for epoch in range(self.configs.epochs):
+        for epoch in range(start_epoch, self.configs.epochs):
             self.run_train_epoch(epoch, self.configs.batch_size)
             self.opt_lr_scheduler.step()
-
             print('training lr at epoch {} is {}'.format(epoch, self.opt_lr_scheduler.get_last_lr()[0]))
 
     def logger(self, info, log_file, debug=True):
@@ -140,11 +159,12 @@ class TrainClient():
         tq = tqdm.tqdm(iter(data_loader), desc='Training epoch {}'.format(epoch), total=num_batches, dynamic_ncols=True)
 
         start_time = time.time()
-
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
         for i, batch in enumerate(tq):
             batch_tmp = {}
             for k, v in batch.items():
-                v = torch.FloatTensor(v)
+                v = torch.FloatTensor(np.array(v))
                 batch_tmp[k] = v.to(device)
             batch = batch_tmp
 
@@ -182,14 +202,24 @@ class TrainClient():
             bce_loss.backward()
             self.optimiser.step()
 
+            epoch_loss_sum += bce_loss.item()
+            epoch_loss_count += 1
+
             strprint = "loss at epoch {}, iter {}/{},bce:{:.4f}, time cost={}".format(
                 epoch, i, num_batches, bce_loss, round(time.time() - start_time, 2))
 
             self.logger(strprint, log_file=self.log_file, debug=False)
-            start_time = time.time()
+            start_time = time.time()  # <-- this is per batch, keep for batch timing
 
             tq.set_postfix_str(strprint)
 
+        # Log mean loss for the epoch
+        mean_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
+        self.writer.add_scalar('Loss/train', mean_loss, epoch)
+
+        # Log epoch duration
+        epoch_time = time.time() - tq.start_t
+        self.writer.add_scalar('Time/epoch_train', epoch_time, epoch)
 
         self.run_test(epoch, batch_size=self.configs.batch_size, full_batch=True)
 
@@ -211,14 +241,15 @@ class TrainClient():
         all_preds_cvt_values = {'lon': [], 'lat': [], 'alt': [], 'spdx': [], 'spdy': [], 'spdz': []}
         all_targs_cvt_values = {'lon': [], 'lat': [], 'alt': [], 'spdx': [], 'spdy': [], 'spdz': []}
 
-
-        for i, batch in enumerate(data_loader):
+        tq = tqdm.tqdm(enumerate(data_loader), desc='Testing epoch {}'.format(epoch), total=batch_num, dynamic_ncols=True)
+        for i, batch in tq:
+            start_time = time.time()
+            
             batch_tmp = {}
             for k, v in batch.items():
-                v = torch.FloatTensor(v)
+                v = torch.FloatTensor(np.array(v))
                 batch_tmp[k] = v.to(device)
             batch = batch_tmp
-
             input_items = batch['lon'], batch['lat'], batch['alt'], batch['spdx'], batch['spdy'], \
                           batch['spdz']
 
@@ -270,7 +301,11 @@ class TrainClient():
         for k, v in all_preds_cvt_values.items():
             all_preds_cvt_values[k] = np.array(v)
 
-        evalute_horizons = [1, 3, 9, 15] # range(1, self.configs.horizon + 1)
+        # Log mean validation loss for the epoch
+        mean_val_loss = np.mean(losses) if len(losses) > 0 else 0.0
+        self.writer.add_scalar('Loss/val', mean_val_loss, epoch)
+
+        evalute_horizons = [1, 3, 9] # range(1, self.configs.horizon + 1)
         for horizon in evalute_horizons:
             self.logger('Evaluation summary of Epoch:{}, Horizon:{}'.format(epoch, horizon), log_file=self.log_file)
 
@@ -329,6 +364,27 @@ class TrainClient():
 
             MDE = self.Cal_MDE(all_targs_cvt_values, all_preds_cvt_values, horizon)
 
+            # Calculate new metrics
+            # Ensure all values are numpy arrays and at least 2D before slicing
+            def safe_slice(arr, horizon):
+                arr = np.array(arr)
+                if arr.ndim == 1:
+                    return arr[:horizon]
+                elif arr.ndim >= 2:
+                    return arr[:, :horizon]
+                return arr
+            preds_h = {k: safe_slice(v, horizon) for k, v in all_preds_cvt_values.items()}
+            targs_h = {k: safe_slice(v, horizon) for k, v in all_targs_cvt_values.items()}
+
+            max_distance = calculate_max_distance(preds_h, targs_h)
+            frechet_dist = calculate_trajectory_frechet_distance(preds_h, targs_h, horizon)
+            dtw_distances = calculate_trajectory_dtw_distance(preds_h, targs_h, horizon)
+            # Calculate DTW for the whole trajectory (up to horizon)
+            dtw_whole = calculate_trajectory_dtw_distance_whole(preds_h, targs_h)
+            
+            dtw_summary = 'lon:{:.4f},lat:{:.4f},alt:{:.4f}'.format(
+                dtw_distances['lon'], dtw_distances['lat'], dtw_distances['alt']
+            )
 
             self.logger('Evaluation summary of Epoch:{}, batch:{}, MAE:{}'.format(
                 epoch, batch_num, print_mae_details), log_file=self.log_file)
@@ -342,6 +398,39 @@ class TrainClient():
             self.logger('Evaluation summary of Epoch:{}, batch:{}, MDE:{}'.format(
                 epoch, batch_num, MDE), log_file=self.log_file)
 
+            self.logger('Evaluation summary of Epoch:{}, batch:{}, MAX_DISTANCE:{:.4f}'.format(
+                epoch, batch_num, max_distance), log_file=self.log_file)
+
+            self.logger('Evaluation summary of Epoch:{}, batch:{}, FRECHET_DISTANCE:{:.4f}'.format(
+                epoch, batch_num, frechet_dist), log_file=self.log_file)
+            self.logger('Evaluation summary of Epoch:{}, batch:{}, DTW_DISTANCES:{}'.format(
+                epoch, batch_num, dtw_summary), log_file=self.log_file)
+            self.logger('Evaluation summary of Epoch:{}, batch:{}, DTW_WHOLE:{:.4f}'.format(
+                epoch, batch_num, dtw_whole), log_file=self.log_file)
+
+            self.writer.add_scalar(f'RMSE/lon_h{horizon}', lon_rmse, epoch)
+            self.writer.add_scalar(f'RMSE/lat_h{horizon}', lat_rmse, epoch)
+            self.writer.add_scalar(f'RMSE/alt_h{horizon}', alt_rmse, epoch)
+            self.writer.add_scalar(f'RMSE/spdx_h{horizon}', spdx_rmse, epoch)
+            self.writer.add_scalar(f'RMSE/spdy_h{horizon}', spdy_rmse, epoch)
+            self.writer.add_scalar(f'RMSE/spdz_h{horizon}', spdz_rmse, epoch)
+            self.writer.add_scalar(f'MAE/lon_h{horizon}', lon_mse, epoch)
+            self.writer.add_scalar(f'MAE/lat_h{horizon}', lat_mse, epoch)
+            self.writer.add_scalar(f'MAE/alt_h{horizon}', alt_mse, epoch)
+            self.writer.add_scalar(f'MAE/spdx_h{horizon}', spdx_mse, epoch)
+            self.writer.add_scalar(f'MAE/spdy_h{horizon}', spdy_mse, epoch)
+            self.writer.add_scalar(f'MAE/spdz_h{horizon}', spdz_mse, epoch)
+            self.writer.add_scalar(f'MAPE/lon_h{horizon}', lon_mape * 100, epoch)
+            self.writer.add_scalar(f'MAPE/lat_h{horizon}', lat_mape * 100, epoch)
+            self.writer.add_scalar(f'MAPE/alt_h{horizon}', alt_mape * 100, epoch)
+            self.writer.add_scalar(f'MDE/h{horizon}', MDE, epoch)
+            self.writer.add_scalar(f'MAX_DISTANCE/h{horizon}', max_distance, epoch)
+            self.writer.add_scalar(f'FRECHET_DISTANCE/h{horizon}', frechet_dist, epoch)
+            self.writer.add_scalar(f'DTW/lon_h{horizon}', dtw_distances['lon'], epoch)
+            self.writer.add_scalar(f'DTW/lat_h{horizon}', dtw_distances['lat'], epoch)
+            self.writer.add_scalar(f'DTW/alt_h{horizon}', dtw_distances['alt'], epoch)
+            self.writer.add_scalar(f'DTW/whole_h{horizon}', dtw_whole, epoch)
+
         if self.configs.is_training:
             save_torch_model(self.model, self.optimiser,
                              self.log_path + "/epoch_{}_{}.pt".format(epoch, np.mean(avg_acc)))
@@ -349,7 +438,7 @@ class TrainClient():
 
             self.keep_model_list.append(model_path)
 
-            if len(self.keep_model_list) > 5:
+            if len(self.keep_model_list) > 2:
                 rm = self.keep_model_list.pop(0)
                 os.remove(rm)
 
@@ -366,12 +455,16 @@ class TrainClient():
         return X, Y, Z
 
     def Cal_MDE(self, pred, tart, horizon):
-        X, Y, Z = self.gc2ecef(np.array(pred['lon'][:, :horizon]), np.array(pred['lat'][:, :horizon]),
-                               np.array(pred['alt'][:, :horizon]) / 100)
-        X_t, Y_t, Z_t = self.gc2ecef(np.array(tart['lon'][:, :horizon]), np.array(tart['lat'][:, :horizon]),
-                                     np.array(tart['alt'][:, :horizon]) / 100)
-        MDE = np.mean(np.sqrt((X - X_t) ** 2 + (Y - Y_t) ** 2 + (Z - Z_t) ** 2))
-
+        mde_values = []
+        for i in range(len(pred['lon'])):
+            # Convert to ECEF coordinates (in km)
+            X, Y, Z = self.gc2ecef(pred['lon'][i][:horizon], pred['lat'][i][:horizon],
+                                   pred['alt'][i][:horizon] / 100)
+            X_t, Y_t, Z_t = self.gc2ecef(tart['lon'][i][:horizon], tart['lat'][i][:horizon],
+                                         tart['alt'][i][:horizon] / 100)
+            mde = np.mean(np.sqrt((X - X_t) ** 2 + (Y - Y_t) ** 2 + (Z - Z_t) ** 2))
+            mde_values.append(mde)
+        MDE = np.mean(mde_values)
         return MDE
 
     def calculate_loss(self, model_outputs, target_items, raw_data, mode='train'):
@@ -407,7 +500,8 @@ class TrainClient():
 
         preds = [lon_logits, lat_logits, alt_logits, spdx_logits, spdy_logits, spdz_logits]
         trgts = [lon_targ, lat_targ, alt_targ, spdx_targ, spdy_targ, spdz_targ]
-
+        
+        # Measure execution time for evaluation
         accs, cvt_values = self.evalute_all(preds, trgts, raw_data)
 
         return loss, accs, cvt_values
@@ -429,24 +523,27 @@ class TrainClient():
         pred = (pred >= 0.5).int()
         trgt = trgt.int()
 
-        batch_szie, seq, dim = pred.size()
+        batch_size, seq, dim = pred.size()
         acc = 0.0
         batch_cvt_preds = []
         batch_cvt_trgts = []
 
-        last_pred = 0.0
+        # Move everything to cpu and numpy once
+        pred_np = pred.cpu().numpy()
+        trgt_np = trgt.cpu().numpy()
+        raw_np = raw.cpu().numpy() if isinstance(raw, torch.Tensor) else np.array(raw)
 
-        for i in range(batch_szie):
+        for i in range(batch_size):
             cvt_preds = []
             cvt_trgts = []
+            last_pred = 0.0
             for j in range(seq):
-                pred_list = pred[i][j].cpu().numpy().tolist()
-                trgt_list = trgt[i][j].cpu().numpy().tolist()
+                pred_list = pred_np[i, j].tolist()
+                trgt_list = trgt_np[i, j].tolist()
                 if pred_list == trgt_list:
                     acc += 1
 
                 p_sign, t_sign = pred_list[0], trgt_list[0]
-
                 cvt_pred = convert2binfromlist(pred_list[1:])
                 # cvt_trgt = convert2binfromlist(trgt_list[1:])
 
@@ -457,26 +554,29 @@ class TrainClient():
                 #     cvt_trgt = -cvt_trgt
 
                 if j == 0:
-                    real_pred = raw[i, self.configs.inp_seq_len + j - 1] + cvt_pred
+                    real_pred = raw_np[i, self.configs.inp_seq_len + j - 1] + cvt_pred
                     last_pred = real_pred
                 else:
                     real_pred = last_pred + cvt_pred
                     last_pred = real_pred
 
-                real_targt = raw[i, self.configs.inp_seq_len + j]
+                real_targt = raw_np[i, self.configs.inp_seq_len + j]
 
                 if name in ('lon', 'lat'):
                     real_pred = real_pred / 1000.0
                     # cvt_trgt = cvt_trgt / 1000.0
                     real_targt = real_targt / 1000.0
 
-                cvt_preds.append(real_pred.cpu().numpy())
-                cvt_trgts.append(real_targt.cpu().numpy())
+                cvt_preds.append(real_pred)
+                cvt_trgts.append(real_targt)
 
             batch_cvt_preds.append(cvt_preds)
             batch_cvt_trgts.append(cvt_trgts)
 
-        return acc / (batch_szie * seq), np.array(batch_cvt_preds), np.array(batch_cvt_trgts)
+        return acc / (batch_size * seq), np.array(batch_cvt_preds), np.array(batch_cvt_trgts)
+
+    def close(self):
+        self.writer.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -485,3 +585,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     tc = TrainClient(json_path=args.config)
     tc.run()
+    tc.close()

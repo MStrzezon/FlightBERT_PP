@@ -3,7 +3,14 @@ import logging
 import os
 import random
 import numpy as np
+import pandas as pd
 import torch.utils.data as da
+from pyproj import Transformer
+import math
+from tqdm import tqdm
+import pickle
+import hashlib
+import json
 
 RNG_SEED = 123
 logger = logging.getLogger(__name__)
@@ -15,6 +22,9 @@ class DataGenerator(da.Dataset):
         self.rng = random.Random(RNG_SEED)
         self.data_num = 0
         self.datas = []
+        
+        # Initialize coordinate transformer from WGS84 to EPSG:2180 (Polish coordinate system)
+        self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:2180", always_xy=True)
 
         self.target_size = {'lon': self.configs.delta_lon_size,
                             'lat': self.configs.delta_lat_size,
@@ -23,30 +33,202 @@ class DataGenerator(da.Dataset):
                             'spdy': self.configs.delta_spdy_size,
                             'spdz': self.configs.delta_spdz_size}
 
-    def load_data_from_dir(self, data_path):
-        for root, dirs, files in os.walk(data_path):
+    def _get_cache_key(self, data_path):
+        """Generate a cache key based on data path and configuration parameters"""
+        # Include relevant config parameters that affect data processing
+        config_params = {
+            'inp_seq_len': self.configs.inp_seq_len,
+            'horizon': self.configs.horizon,
+            'data_period': self.configs.data_period,
+            'sliding_window_step': getattr(self.configs, 'sliding_window_step', self.configs.inp_seq_len),
+        }
+        
+        # Get list of parquet files and their modification times
+        file_info = []
+        for root, _, files in os.walk(data_path):
             for f in files:
-                if not f.endswith('.txt'):
+                if f.endswith('.parquet'):
+                    file_path = os.path.join(root, f)
+                    try:
+                        mtime = os.path.getmtime(file_path)
+                        file_info.append((f, mtime))
+                    except OSError:
+                        continue
+        
+        # Sort for consistent hashing
+        file_info.sort()
+        
+        # Create hash from config params, data path, and file info
+        cache_data = {
+            'data_path': data_path,
+            'config_params': config_params,
+            'file_info': file_info
+        }
+        
+        cache_str = json.dumps(cache_data, sort_keys=True)
+        cache_hash = hashlib.md5(cache_str.encode()).hexdigest()
+        
+        return f"dataset_cache_{cache_hash}.pkl"
+    
+    def _get_cache_dir(self):
+        """Get or create cache directory"""
+        cache_dir = os.environ.get('FLIGHTBERT_CACHE_DIR', './cache')
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        return cache_dir
+    
+    def _save_dataset_cache(self, data_path):
+        """Save processed dataset to cache"""
+        try:
+            cache_dir = self._get_cache_dir()
+            cache_key = self._get_cache_key(data_path)
+            cache_path = os.path.join(cache_dir, cache_key)
+            
+            cache_data = {
+                'datas': self.datas,
+                'data_num': self.data_num,
+                'data_path': data_path,
+                'config_params': {
+                    'inp_seq_len': self.configs.inp_seq_len,
+                    'horizon': self.configs.horizon,
+                    'data_period': self.configs.data_period,
+                    'sliding_window_step': getattr(self.configs, 'sliding_window_step', self.configs.inp_seq_len),
+                }
+            }
+            
+            print(f"Saving dataset cache to: {cache_path}")
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            print(f"✓ Dataset cache saved successfully ({len(self.datas)} sequences)")
+            
+        except Exception as e:
+            print(f"Warning: Failed to save dataset cache: {e}")
+    
+    def _load_dataset_cache(self, data_path):
+        """Load processed dataset from cache if available and valid"""
+        try:
+            cache_dir = self._get_cache_dir()
+            cache_key = self._get_cache_key(data_path)
+            cache_path = os.path.join(cache_dir, cache_key)
+            
+            if not os.path.exists(cache_path):
+                return False
+            
+            print(f"Found dataset cache: {cache_path}")
+            print("Loading cached dataset...")
+            
+            with open(cache_path, 'rb') as f:
+                cache_data = pickle.load(f)
+            
+            # Verify cache data structure
+            if not all(key in cache_data for key in ['datas', 'data_num', 'data_path', 'config_params']):
+                print("Warning: Invalid cache data structure, will rebuild dataset")
+                return False
+            
+            # Load cached data
+            self.datas = cache_data['datas']
+            self.data_num = cache_data['data_num']
+            
+            print(f"✓ Dataset loaded from cache:")
+            print(f"  - Data path: {cache_data['data_path']}")
+            print(f"  - Total sequences: {self.data_num}")
+            
+            # Shuffle if training
+            if self.configs.is_training:
+                print("Shuffling training data...")
+                random.shuffle(self.datas)
+                self.data_num = len(self.datas)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Warning: Failed to load dataset cache: {e}")
+            print("Will rebuild dataset from scratch")
+            return False
+
+    def load_data_from_dir(self, data_path):
+        """Load data from directory with caching support"""
+        print(f"Loading data from: {data_path}")
+        
+        # Try to load from cache first
+        if self._load_dataset_cache(data_path):
+            return
+        
+        print("Cache not found or invalid, processing parquet files...")
+        
+        # First, collect all parquet files
+        parquet_files = []
+        for root, _, files in os.walk(data_path):
+            for f in files:
+                if f.endswith('.parquet'):
+                    parquet_files.append(os.path.join(root, f))
+        
+        if len(parquet_files) == 0:
+            print(f"Warning: No parquet files found in {data_path}")
+            return
+        
+        print(f"Found {len(parquet_files)} parquet files to process")
+        
+        # Process files with progress bar
+        total_sequences_added = 0
+        for parquet_path in tqdm(parquet_files, desc="Processing parquet files", unit="file"):
+            try:
+                df = pd.read_parquet(parquet_path)
+                
+                # Validate required columns
+                required_columns = ['latitude', 'longitude', 'altitude', 'track', 'groundspeed', 'vertical_rate']
+                if not all(col in df.columns for col in required_columns):
+                    tqdm.write(f"Skipping {os.path.basename(parquet_path)}: missing required columns")
                     continue
+                
+                # Sort by timestamp if available (assuming there's a timestamp column)
+                if 'timestamp' in df.columns:
+                    df = df.sort_values('timestamp')
+                
+                # Convert to list of records for sliding window processing
+                records = []
+                for _, row in df.iterrows():
+                    # Create record in format compatible with existing processing
+                    # Format: timestamp|unused|unused|unused|lon|lat|alt|track|groundspeed|vertical_rate
+                    timestamp = row.get('timestamp', 0)  # Use 0 if no timestamp
+                    record = f"{timestamp}|0|0|0|{row['longitude']}|{row['latitude']}|{row['altitude']}|{row['track']}|{row['groundspeed']}|{row['vertical_rate']}\n"
+                    records.append(record)
+                
+                sliding_window_step = getattr(self.configs, 'sliding_window_step', self.configs.inp_seq_len)
+                sequences_before = len(self.datas)
 
-                txt_path = os.path.join(root, f)
-                with open(txt_path, 'r') as fr:
-                    lines = fr.readlines()
+                if self.configs.data_period == 1:
+                    # Process all records as a sliding window
+                    while len(records) > self.configs.inp_seq_len + self.configs.horizon:
+                        self.datas.append(records[:self.configs.inp_seq_len + self.configs.horizon])
+                        records = records[sliding_window_step:]
+                else:
+                    for i in range(1, self.configs.data_period - 1):
+                        sub_records = records[self.configs.data_period - i::self.configs.data_period]
+                        while len(sub_records) > self.configs.inp_seq_len + self.configs.horizon:
+                            self.datas.append(sub_records[:self.configs.inp_seq_len + self.configs.horizon])
+                            sub_records = sub_records[sliding_window_step:]
+                
+                sequences_added = len(self.datas) - sequences_before
+                total_sequences_added += sequences_added
+                tqdm.write(f"✓ {os.path.basename(parquet_path)}: {len(df)} records → {sequences_added} sequences")
+            
+            except Exception as e:
+                tqdm.write(f"✗ Error processing {os.path.basename(parquet_path)}: {e}")
+                continue
 
-                # lines = lines[self.configs.data_period - 1::self.configs.data_period]
-                # while len(lines) > self.configs.inp_seq_len + self.configs.horizon:
-                #     self.datas.append(lines[:self.configs.inp_seq_len + self.configs.horizon])
-                #     lines = lines[1:]
+        print(f"\nData processing complete:")
+        print(f"- Total files processed: {len(parquet_files)}")
+        print(f"- Total sequences created: {len(self.datas)}")
+        print(f"- Data path: {data_path}")
 
-                for i in range(1, self.configs.data_period - 1):
-                    sub_lines = lines[self.configs.data_period - i::self.configs.data_period]
-                    while len(sub_lines) > self.configs.inp_seq_len + self.configs.horizon:
-                        self.datas.append(sub_lines[:self.configs.inp_seq_len + self.configs.horizon])
-                        sub_lines = sub_lines[self.configs.inp_seq_len:]
-
-        print(data_path, 'data num:', len(self.datas))
+        # Save to cache for future use
+        if len(self.datas) > 0:
+            self._save_dataset_cache(data_path)
 
         if self.configs.is_training:
+            print("Shuffling training data...")
             random.shuffle(self.datas)
 
         self.data_num = len(self.datas)
@@ -117,7 +299,7 @@ class DataGenerator(da.Dataset):
             bin_spdz = '{0:b}'.format(int(spdz)).zfill(self.configs.spdz_size)
             bin_spdz_list = [int(i) for i in bin_spdz]
 
-        assert len(bin_spdz_list) == self.configs.spdx_size, "ERROR"
+        assert len(bin_spdz_list) == self.configs.spdz_size, "ERROR"
         return np.array(bin_spdz_list)
 
     def prepare_minibatch(self, seqs):
@@ -133,8 +315,17 @@ class DataGenerator(da.Dataset):
 
             for record in seq:
                 items = record.strip().split("|")
-                data_time, lon, lat, alt, spdx, spdy, spdz = items[0], float(items[4]), float(items[5]), float(
-                    items[6]), float(items[7]), float(items[8]), float(items[9])
+                # New format: timestamp|unused|unused|unused|lon|lat|alt|track|groundspeed|vertical_rate
+                data_time = items[0]
+                lon = float(items[4])
+                lat = float(items[5]) 
+                alt = float(items[6])
+                track = float(items[7])
+                groundspeed = float(items[8])
+                vertical_rate = float(items[9])
+                
+                # Calculate speed components from track, groundspeed, and vertical_rate
+                spdx, spdy, spdz = self.calculate_speed_components(lon, lat, track, groundspeed, vertical_rate)
 
                 seq_lon.append(self.convert_lon2binary(lon))
                 seq_lat.append(self.convert_lat2binary(lat))
@@ -237,3 +428,75 @@ class DataGenerator(da.Dataset):
             bin_list = [0] * (self.target_size[type])
 
         return np.array(bin_list)
+
+    def calculate_speed_components(self, lon, lat, track, groundspeed, vertical_rate):
+        """
+        Calculate spdx, spdy, spdz from longitude, latitude, track, groundspeed, and vertical_rate
+        using coordinate transformation to EPSG:2180
+        
+        Args:
+            lon: longitude in degrees
+            lat: latitude in degrees  
+            track: track angle in degrees (direction of movement)
+            groundspeed: ground speed in m/s or knots (will be normalized)
+            vertical_rate: vertical rate in m/s or ft/min (will be normalized)
+        
+        Returns:
+            tuple: (spdx, spdy, spdz) - speed components in m/s
+        """
+        # Convert track angle to radians
+        track_rad = math.radians(track)
+        
+        # Calculate horizontal speed components
+        # spdx = eastward component (positive = east)
+        # spdy = northward component (positive = north)
+        spdx = groundspeed * math.sin(track_rad)  # East component
+        spdy = groundspeed * math.cos(track_rad)  # North component
+        
+        # spdz is the vertical rate (already available)
+        spdz = vertical_rate
+        
+        return spdx, spdy, spdz
+
+    def clear_cache(self, data_path=None):
+        """Clear dataset cache for specific data path or all caches"""
+        cache_dir = self._get_cache_dir()
+        
+        if data_path:
+            # Clear specific cache
+            cache_key = self._get_cache_key(data_path)
+            cache_path = os.path.join(cache_dir, cache_key)
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+                print(f"✓ Cleared cache for: {data_path}")
+            else:
+                print(f"No cache found for: {data_path}")
+        else:
+            # Clear all caches
+            if os.path.exists(cache_dir):
+                cache_files = [f for f in os.listdir(cache_dir) if f.startswith('dataset_cache_') and f.endswith('.pkl')]
+                for cache_file in cache_files:
+                    os.remove(os.path.join(cache_dir, cache_file))
+                print(f"✓ Cleared {len(cache_files)} cache files")
+            else:
+                print("No cache directory found")
+    
+    def get_cache_info(self, data_path):
+        """Get information about cache for specific data path"""
+        cache_dir = self._get_cache_dir()
+        cache_key = self._get_cache_key(data_path)
+        cache_path = os.path.join(cache_dir, cache_key)
+        
+        if os.path.exists(cache_path):
+            stat = os.stat(cache_path)
+            size_mb = stat.st_size / (1024 * 1024)
+            mtime = stat.st_mtime
+            
+            print(f"Cache info for: {data_path}")
+            print(f"  - Cache file: {cache_key}")
+            print(f"  - Size: {size_mb:.2f} MB")
+            print(f"  - Modified: {pd.to_datetime(mtime, unit='s')}")
+            return True
+        else:
+            print(f"No cache found for: {data_path}")
+            return False

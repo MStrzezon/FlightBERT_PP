@@ -62,6 +62,8 @@ The training and testing are both packaged into the script of `run.py` for the F
 
 The main arguments in `config.json` are described below:
 
+`data_type`: String. Information about the type of training data.
+
 `learning_rate`: Float. The learning rate of the Adam optimizer. `default=0.0001`
 
 `period`: Integer. The sampling period for dataloader. `default=5`
@@ -88,6 +90,8 @@ The main arguments in `config.json` are described below:
 
 `model_path`: String. The checkpoint model path for the traning or testing. `default=''`
 
+`sliding_window_step`: String. The step size for the sliding window during data processing.
+
 
 To train the FlightBERT++ framework, use the following command.
 
@@ -108,6 +112,11 @@ python run.py --config ./config.json
 In this repository, the example samples `/data/example_data.txt` are provided to facilitate quick start. 
 The guidance about the example data can be found in `/data/README`. 
 
+# Improvements
+- loading data from parquet files that contains `Flight` object from `Traffic` library. The data must contain columns: `latitude`, `longitude`, `altitude`, `track`, `groundspeed`, `vertical_rate`. After initial preprocessing data is cached in `cache` folder.
+- possibility to define `sliding_window_step` in `config.json`.
+- TensorBoard logging
+- new metrics for evaluation: `max distance`, `frechet distance`, `dynamic time warping distance`
 
 # Citation
 
